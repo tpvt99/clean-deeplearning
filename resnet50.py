@@ -36,7 +36,7 @@ debug = False # Adjust this to False if not printing to understand the models
 MAIN = __name__ == "__main__"
 # %%
 class ResidualBlock(nn.Module):
-    def __init__(self, in_feats: int, out_feats: int, first_stride=1):
+    def __init__(self, in_feats: int, inner_feats:int,  out_feats: int, first_stride=1):
         '''
         A single residual block with optional downsampling.
 
@@ -46,37 +46,31 @@ class ResidualBlock(nn.Module):
         '''
         super().__init__()
         self.in_feats = in_feats
+        self.inner_feats = inner_feats
         self.out_feats = out_feats
         self.first_stride = first_stride
 
-        # In the paper, residual block are 2 blocks sit inside the skip conv (no dashed), 
-        # e.g. for 34-residual
-        #
-        # 3x3 conv, 64
-        # 3x3 conv, 64
-        #
-        # Input has shape (b, 64, 56, 56), thus because first_stride = 1(no dashed skip connection),
-        # padding must be 1 so that output side is still (b, 64, 56, 56)
-
-        ## However, if first_stride > 1 (dashed skip connection), inputs and outputs are:
-        # Input shape (b, 64, 56, 56), output shape is (b, 128, 28, 28)
-        # which is doubling the channels and downsampling the height and width
-        # thus in main branch, we use stride=first_strde to reduce the height and width
-        # and the same time, we add skip_branch with stride=first_stride to also reduce height and width
-        # we keep kernel = 3, padding = 1 in both stride=1 and stride > 1
-
+        self.main_branch = nn.Sequential(
+                nn.Conv2d(in_channels=in_feats, out_channels=inner_feats, kernel_size=1, stride=first_stride,
+                            padding = 0, bias=False),
+                nn.BatchNorm2d(num_features=inner_feats),
+                nn.ReLU(),
+                nn.Conv2d(in_channels=inner_feats, out_channels=inner_feats, kernel_size=3, stride=1, padding=1,
+                            bias=False),
+                nn.BatchNorm2d(num_features=inner_feats),
+                nn.ReLU(),
+                nn.Conv2d(in_channels=inner_feats, out_channels=out_feats, kernel_size=1, stride=1, padding=0,
+                            bias=False),
+                nn.BatchNorm2d(num_features=out_feats)
+        )
         
-        self.main_conv2d_x1 = nn.Conv2d(in_channels=in_feats, out_channels=out_feats, kernel_size=3, stride=first_stride,
-                   padding = 1, bias=False)
-        self.main_bn1 = nn.BatchNorm2d(num_features=out_feats)
-        self.main_relu1 = nn.ReLU()
-        self.main_conv2d_x2 = nn.Conv2d(in_channels=out_feats, out_channels=out_feats, kernel_size=3, stride=1, padding=1,
-                      bias=False)
-        self.main_bn2 = nn.BatchNorm2d(num_features=out_feats)
 
         self.skip_branch = nn.Identity()
 
-        if first_stride > 1:
+        # first_stride > 1 for changing width/height for blocks from 2->3, 3->4, 4->5
+        # it is enough for resnet34 because each block does not change the channels
+        # for resnet50, 101, 152, we need to add condition is that if out_c != in_c, then we also add skip
+        if first_stride > 1 or out_feats != in_feats:
             self.skip_branch = nn.Sequential(
                 nn.Conv2d(in_channels=in_feats, out_channels=out_feats, kernel_size=1, stride=first_stride,
                        padding=0, bias=False),
@@ -95,12 +89,7 @@ class ResidualBlock(nn.Module):
 
         If no downsampling block is present, the addition should just add the left branch's output to the input.
         '''
-
-        residual = self.main_conv2d_x1(x)
-        residual = self.main_bn1(residual)
-        residual = self.main_relu1(residual)
-        residual = self.main_conv2d_x2(residual)
-        residual = self.main_bn2(residual)
+        residual = self.main_branch(x)
 
         skip = self.skip_branch(x)
 
@@ -115,7 +104,7 @@ class ResidualBlock(nn.Module):
  
 # %%
 class BlockGroup(nn.Module):
-    def __init__(self, n_blocks: int, in_feats: int, out_feats: int, first_stride: int = 1):
+    def __init__(self, n_blocks: int, in_feats: int, inner_feats: int, out_feats: int, first_stride: int = 1):
         '''
             An n_blocks-long sequence of ResidualBlock where only the first block uses the provided stride.
         '''
@@ -126,11 +115,13 @@ class BlockGroup(nn.Module):
         ## Can use either Sequential or ModuleList
         residual_blocks = []
         residual_blocks.append(ResidualBlock(in_feats=in_feats, 
+                                             inner_feats=inner_feats,
                                                  out_feats=out_feats,
                                                  first_stride=first_stride))
         
         for _ in range(1, n_blocks):
             residual_blocks.append(ResidualBlock(in_feats=out_feats,
+                                                 inner_feats=inner_feats,
                                                  out_feats=out_feats,
                                                  first_stride=1))
 
@@ -153,18 +144,20 @@ class BlockGroup(nn.Module):
 
         return output
 # %%
-class ResNet34(nn.Module):
+class ResNet50(nn.Module):
     def __init__(
             self,
             n_blocks_per_group = (3, 4, 6, 3),
-            in_features_per_group = (64, 64, 128, 256),
-            out_features_per_group = (64, 128, 256, 512),
+            in_features_per_group = (64, 256, 512, 1024),
+            inner_features_pe_group = (64, 128, 256, 512),
+            out_features_per_group = (256, 512, 1024, 2048),
             first_strides_per_group = (1, 2, 2, 2),
             n_classes = 1000
     ):
         super().__init__()
         self.n_blocks_per_group = n_blocks_per_group
         self.in_features_per_group = in_features_per_group
+        self.inner_features_per_group = inner_features_pe_group
         self.out_features_per_group = out_features_per_group
         self.first_strides_per_group = first_strides_per_group
         self.n_classes = n_classes
@@ -184,6 +177,7 @@ class ResNet34(nn.Module):
         for i in range(len(n_blocks_per_group)):
             blocks.append(BlockGroup(n_blocks = n_blocks_per_group[i],
                                           in_feats = in_features_per_group[i],
+                                          inner_feats= inner_features_pe_group[i],
                                           out_feats = out_features_per_group[i],
                                           first_stride = first_strides_per_group[i]))
 
@@ -194,7 +188,7 @@ class ResNet34(nn.Module):
         # average pool
         self.avg_pool = t.nn.AdaptiveAvgPool2d(output_size=(1,1))
         self.flatten = t.nn.Flatten()
-        self.linear = nn.Linear(in_features = 512, out_features=n_classes)
+        self.linear = nn.Linear(in_features = 2048, out_features=n_classes)
 
 
     def forward(self, x: t.Tensor) -> t.Tensor:
@@ -218,7 +212,7 @@ class ResNet34(nn.Module):
 
 # %%
 # Veryfing your implementation by loading weights
-def copy_weights(my_resnet : ResNet34, pretrained_resnet: torchvision.models.resnet34, copy=False) -> ResNet34:
+def copy_weights(my_resnet : ResNet50, pretrained_resnet: torchvision.models.resnet34, copy=False) -> ResNet50:
     '''
         Copy over the weights of `pretrained_resnet` to your resnet
     '''
@@ -240,68 +234,66 @@ def copy_weights(my_resnet : ResNet34, pretrained_resnet: torchvision.models.res
  #%%
  ## This is to print how many parameters
 if MAIN and debug:
-    my_resnet = ResNet34()
-    pretrained_resnet = torchvision.models.resnet34(weights=torchvision.models.ResNet34_Weights.IMAGENET1K_V1)
+    my_resnet = ResNet50()
+    pretrained_resnet = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V1)
     print(summary(my_resnet, input_data = torch.rand(2, 3, 32, 32), verbose=0, depth=10))
     print(summary(pretrained_resnet, input_data = torch.rand(2,3,32,32)))
 #%%
 ## This is to load pre-trained weights
 if MAIN and debug:
-    my_resnet = ResNet34()
-    pretrained_resnet = torchvision.models.resnet34(weights=torchvision.models.ResNet34_Weights.IMAGENET1K_V1)
+    my_resnet = ResNet50()
+    pretrained_resnet = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V1)
     my_resnet = copy_weights(my_resnet, pretrained_resnet)
 # %%
 ## This is to display pandas frame between parameters and check
 if MAIN and debug:
-    my_resnet = ResNet34()
-    pretrained_resnet = torchvision.models.resnet34(weights=torchvision.models.ResNet34_Weights.IMAGENET1K_V1)
+    my_resnet = ResNet50()
+    pretrained_resnet = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V1)
     print_param_count(my_resnet, pretrained_resnet)
 # %%
 
-def get_cifar10(subset: int = 1):
+def get_dataset(subset: int = 1):
     IMAGE_SIZE = 32
-    CIFAR10_MEAN = (0.485, 0.456, 0.406)
-    CIFAR10_STD = (0.229, 0.224, 0.225)
-    TRAIN_CIFAR10_TRANSFORM = transforms.Compose([
-        transforms.Pad(4),
-        transforms.RandomHorizontalFlip(0.5),
-        transforms.RandomCrop(IMAGE_SIZE),
+    MEAN = (0.5070751592371323, 0.48654887331495095, 0.4409178433670343)
+    STD = (0.2673342858792401, 0.2564384629170883, 0.27615047132568404)
+    TRAIN_TRANSFORM = transforms.Compose([
+        transforms.RandomCrop(IMAGE_SIZE, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
         transforms.ToTensor(),
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.Normalize(mean = CIFAR10_MEAN, std=CIFAR10_STD)
+        transforms.Normalize(mean = MEAN, std=STD)
     ])
 
-    TEST_CIFAR10_TRANSFORM = transforms.Compose([
+    TEST_TRANSFORM = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-        transforms.Normalize(mean = CIFAR10_MEAN, std=CIFAR10_STD)
+        transforms.Normalize(mean = MEAN, std=STD)
     ])
 
-    cifar_trainset = datasets.CIFAR10(root = './data', train=True, download=True,
-                                      transform=TRAIN_CIFAR10_TRANSFORM)
-    cifar_testset = datasets.CIFAR10(root = './data', train=False, download=True,
-                                     transform=TEST_CIFAR10_TRANSFORM)
-    print(f"Length of train {len(cifar_trainset)} of test: {len(cifar_testset)}") 
+    trainset = datasets.CIFAR100(root = './data', train=True, download=True,
+                                      transform=TRAIN_TRANSFORM)
+    testset = datasets.CIFAR100(root = './data', train=False, download=True,
+                                     transform=TEST_TRANSFORM)
+    print(f"Length of train {len(trainset)} of test: {len(testset)}") 
     if subset > 1:
-        cifar_trainset = Subset(cifar_trainset, indices=range(0, len(cifar_trainset), subset))
-        cifar_testset = Subset(cifar_testset, indices=range(0, len(cifar_testset), subset))
-        print(f"Subset: Length of train {len(cifar_trainset)} of test: {len(cifar_testset)}") 
+        trainset = Subset(trainset, indices=range(0, len(trainset), subset))
+        testset = Subset(testset, indices=range(0, len(testset), subset))
+        print(f"Subset: Length of train {len(trainset)} of test: {len(testset)}") 
 
-    return cifar_trainset, cifar_testset
+    return trainset, testset
 
 
 @dataclass
 class ResnetTrainingArgs():
     batch_size: int = 128 # 128
     epochs:int = 140 # 140
-    optimizer: Type[t.optim.Optimizer] = t.optim.Adam
-    learning_rate: float = 1e-3
+    optimizer: Type[t.optim.Optimizer] = t.optim.SGD
+    learning_rate: float = 1e-2
     momentum: float = 0.9
-    weight_decay: float = 1e-4
-    n_classes: int = 10
+    weight_decay: float = 5e-4
+    n_classes: int = 100
     subset: int = 1 # 1
-    wandb_project: Optional[str] = "resnet34"
-    wandb_name: Optional[str] = "cifar"
+    wandb_project: Optional[str] = "resnet50"
+    wandb_name: Optional[str] = "cifar100"
 
 
 # %%
@@ -309,10 +301,13 @@ class ResnetTrainingArgs():
 class ResnetTrainer():
     def __init__(self, args: ResnetTrainingArgs):
         self.args = args
-        self.model = ResNet34(n_classes=args.n_classes).to(device)
+        #self.model = ResNet50(n_classes=args.n_classes).to(device)
+        self.model = torchvision.models.resnet50().to(device)
         self.optimizer = self.args.optimizer(self.model.parameters(),
-                                            lr=args.learning_rate, weight_decay=args.weight_decay)
-        self.trainset, self.testset = get_cifar10(args.subset)
+                                            lr=args.learning_rate, 
+                                            weight_decay=args.weight_decay,
+                                            momentum=args.momentum)
+        self.trainset, self.testset = get_dataset(args.subset)
 
         # Store per epoch, not per timestep
         self.step = 0 # gloabl step = epochs * len(data_loader)
@@ -321,7 +316,8 @@ class ResnetTrainer():
             name = args.wandb_name,
             config = self.args
         )
-        wandb.save('resnet34.py')
+
+        wandb.save('resnet50.py')
 
     def train_dataloader(self):
         return DataLoader(self.trainset, batch_size=self.args.batch_size,

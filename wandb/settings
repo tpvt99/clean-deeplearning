@@ -1,0 +1,5 @@
+[default]
+entity = tpvt99
+project = new
+base_url = https://api.wandb.ai
+
